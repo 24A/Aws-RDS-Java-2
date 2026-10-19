@@ -87,3 +87,32 @@ variable "db_allocated_storage" {
   type        = number
   default     = 20
 }
+
+variable "app_instance_type" {
+  description = "EC2 instance type for application servers"
+  type        = string
+  default     = "t3.micro"
+}
+
+variable "application_repository_url" {
+  description = "GitHub repository containing the Java web application"
+  type        = string
+  default     = "https://github.com/24A/Aws-RDS-Java-2.git"
+}
+
+variable "application_branch" {
+  description = "Git branch deployed to application servers"
+  type        = string
+  default     = "feat/terraform-infrastructure"
+}
+
+variable "app_ami_id" {
+  description = "Pinned Ubuntu 22.04 AMI used by the application Launch Template"
+  type        = string
+  default     = "ami-062944a84867f2386"
+}
+
+variable "notification_email" {
+  description = "ahkash12@gmail.com"
+  type        = string
+}

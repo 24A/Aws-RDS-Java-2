@@ -1,0 +1,230 @@
+#!/bin/bash
+set -euo pipefail
+
+exec > >(tee /var/log/project02-user-data.log | logger -t project02-user-data -s 2>/dev/console) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+
+AWS_REGION="${aws_region}"
+RDS_ENDPOINT="${rds_endpoint}"
+RDS_PORT="${rds_port}"
+DB_NAME="${db_name}"
+RDS_SECRET_ARN="${rds_secret_arn}"
+
+APP_REPOSITORY="${repository_url}"
+APP_BRANCH="${repository_branch}"
+
+APP_DIR="/opt/LoginWebApp"
+
+
+# ---------------------------------------------------------
+# Install required packages
+# ---------------------------------------------------------
+
+apt-get update -y
+
+apt-get install -y \
+  openjdk-11-jdk \
+  maven \
+  git \
+  jq \
+  awscli \
+  python3 \
+  tomcat9 \
+  default-mysql-client
+
+
+# ---------------------------------------------------------
+# Start AWS Systems Manager Agent
+# ---------------------------------------------------------
+
+if systemctl list-unit-files | grep -q "^amazon-ssm-agent.service"; then
+
+  systemctl enable --now amazon-ssm-agent
+
+elif systemctl list-unit-files | grep -q "^snap.amazon-ssm-agent.amazon-ssm-agent.service"; then
+
+  systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service
+
+elif command -v snap >/dev/null 2>&1; then
+
+  snap install amazon-ssm-agent --classic || true
+
+  systemctl enable --now \
+    snap.amazon-ssm-agent.amazon-ssm-agent.service || true
+
+fi
+
+
+# ---------------------------------------------------------
+# Retrieve RDS credentials
+# ---------------------------------------------------------
+
+SECRET_JSON=$(aws secretsmanager get-secret-value \
+  --secret-id "$RDS_SECRET_ARN" \
+  --region "$AWS_REGION" \
+  --query SecretString \
+  --output text)
+
+DB_USER=$(printf '%s' "$SECRET_JSON" | jq -r '.username')
+DB_PASSWORD=$(printf '%s' "$SECRET_JSON" | jq -r '.password')
+
+if [ -z "$DB_USER" ] || [ "$DB_USER" = "null" ]; then
+  echo "Unable to retrieve database username."
+  exit 1
+fi
+
+if [ -z "$DB_PASSWORD" ] || [ "$DB_PASSWORD" = "null" ]; then
+  echo "Unable to retrieve database password."
+  exit 1
+fi
+
+
+# ---------------------------------------------------------
+# Wait for RDS connectivity
+# ---------------------------------------------------------
+
+for attempt in $(seq 1 30); do
+
+  if MYSQL_PWD="$DB_PASSWORD" mysql \
+      --host="$RDS_ENDPOINT" \
+      --port="$RDS_PORT" \
+      --user="$DB_USER" \
+      "$DB_NAME" \
+      -e "SELECT 1;" >/dev/null 2>&1; then
+
+    echo "Successfully connected to RDS."
+    break
+
+  fi
+
+  echo "Waiting for RDS connectivity - attempt $attempt of 30"
+
+  if [ "$attempt" -eq 30 ]; then
+    echo "Unable to connect to RDS."
+    exit 1
+  fi
+
+  sleep 10
+
+done
+
+
+# ---------------------------------------------------------
+# Create application database table
+# ---------------------------------------------------------
+
+MYSQL_PWD="$DB_PASSWORD" mysql \
+  --host="$RDS_ENDPOINT" \
+  --port="$RDS_PORT" \
+  --user="$DB_USER" \
+  "$DB_NAME" <<'SQL'
+
+CREATE TABLE IF NOT EXISTS `USER` (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    first_name VARCHAR(100),
+    last_name VARCHAR(100),
+    email VARCHAR(255),
+    username VARCHAR(100) NOT NULL UNIQUE,
+    password VARCHAR(255) NOT NULL,
+    regdate DATE
+);
+
+SQL
+
+
+# ---------------------------------------------------------
+# Clone application repository
+# ---------------------------------------------------------
+
+rm -rf "$APP_DIR"
+
+git clone \
+  --branch "$APP_BRANCH" \
+  --single-branch \
+  "$APP_REPOSITORY" \
+  "$APP_DIR"
+
+
+# ---------------------------------------------------------
+# Insert database configuration
+# ---------------------------------------------------------
+
+export DB_HOST_VALUE="$RDS_ENDPOINT"
+export DB_PORT_VALUE="$RDS_PORT"
+export DB_NAME_VALUE="$DB_NAME"
+export DB_USER_VALUE="$DB_USER"
+export DB_PASSWORD_VALUE="$DB_PASSWORD"
+
+python3 <<'PYTHON'
+import os
+from pathlib import Path
+
+files = [
+    Path("/opt/LoginWebApp/src/main/webapp/login.jsp"),
+    Path("/opt/LoginWebApp/src/main/webapp/userRegistration.jsp"),
+]
+
+def java_escape(value):
+    return (
+        value
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+    )
+
+values = {
+    "__DB_HOST__": java_escape(os.environ["DB_HOST_VALUE"]),
+    "__DB_PORT__": java_escape(os.environ["DB_PORT_VALUE"]),
+    "__DB_NAME__": java_escape(os.environ["DB_NAME_VALUE"]),
+    "__DB_USER__": java_escape(os.environ["DB_USER_VALUE"]),
+    "__DB_PASSWORD__": java_escape(os.environ["DB_PASSWORD_VALUE"]),
+}
+
+for file_path in files:
+    text = file_path.read_text()
+
+    for placeholder, value in values.items():
+        text = text.replace(placeholder, value)
+
+    file_path.write_text(text)
+
+PYTHON
+
+
+# ---------------------------------------------------------
+# Build WAR
+# ---------------------------------------------------------
+
+cd "$APP_DIR"
+
+mvn -DskipTests clean package
+
+
+# ---------------------------------------------------------
+# Deploy application to Tomcat
+# ---------------------------------------------------------
+
+systemctl stop tomcat9
+
+rm -rf /var/lib/tomcat9/webapps/LoginWebApp
+rm -f /var/lib/tomcat9/webapps/LoginWebApp.war
+
+cp target/LoginWebApp.war \
+  /var/lib/tomcat9/webapps/LoginWebApp.war
+
+chown tomcat:tomcat \
+  /var/lib/tomcat9/webapps/LoginWebApp.war
+
+systemctl enable tomcat9
+systemctl start tomcat9
+
+
+# ---------------------------------------------------------
+# Bootstrap completion marker
+# ---------------------------------------------------------
+
+date > /var/log/project02-bootstrap-complete
+
+echo "Project 02 application bootstrap completed successfully."
