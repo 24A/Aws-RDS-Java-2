@@ -161,3 +161,8 @@ output "cloudwatch_alarm_names" {
     aws_cloudwatch_metric_alarm.rds_high_cpu.alarm_name
   ]
 }
+
+output "alb_access_logs_bucket" {
+  description = "S3 bucket storing Application Load Balancer access logs"
+  value       = aws_s3_bucket.alb_logs.id
+}

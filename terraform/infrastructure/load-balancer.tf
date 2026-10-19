@@ -7,6 +7,8 @@ resource "aws_lb" "app" {
   internal           = false
   load_balancer_type = "application"
 
+
+
   security_groups = [
     aws_security_group.alb.id
   ]
@@ -15,6 +17,15 @@ resource "aws_lb" "app" {
     aws_subnet.public_1.id,
     aws_subnet.public_2.id
   ]
+  access_logs {
+    bucket  = aws_s3_bucket.alb_logs.id
+    prefix  = "alb"
+    enabled = true
+
+
+  }
+
+
 
   idle_timeout               = 60
   drop_invalid_header_fields = true
@@ -113,4 +124,8 @@ resource "aws_lb_listener" "https" {
   tags = {
     Name = "${var.project_name}-https-listener"
   }
+
+  depends_on = [
+    aws_s3_bucket_policy.alb_logs
+  ]
 }
